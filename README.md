@@ -81,8 +81,8 @@ The fastest path is a local HTTP server (Python 3.10+ stdlib only — no deps, n
 
 ```bash
 make serve                 # http://127.0.0.1:8765
-# or directly:
-python3 service/scripts/server.py --host 127.0.0.1 --port 8765
+# or directly (include homebrew bin so exiftool/qpdf/c2patool/pdftotext are found):
+PATH="/opt/homebrew/bin:$PATH" python3 service/scripts/server.py --host 127.0.0.1 --port 8765
 ```
 
 For the whole infra (core + optional harness/heavy backends), see [Docker / compose](#docker--compose) below.
@@ -94,6 +94,18 @@ Optional system tools (auto-used when present — preinstalled in the core Docke
 | [`c2patool`](https://github.com/contentauth/c2pa-rs/tree/main/cli) | Inspect C2PA manifests |
 | [`exiftool`](https://exiftool.org/) | Residual metadata strip (esp. **PDF**) |
 | [`qpdf`](https://qpdf.sourceforge.io/) | Structural PDF rebuild — **required** for a real PDF strip (see below) |
+| [`pdftotext`](https://poppler.freedesktop.org/) (poppler) | Extract PDF text for Layer A Unicode + stylometry scan — **required** for detecting invisible marks in Claude-generated PDFs |
+
+Install on macOS:
+
+```bash
+brew install poppler exiftool qpdf
+# c2patool (not in brew tap — install manually):
+curl -L https://github.com/contentauth/c2patool/releases/download/v0.9.12/c2patool-v0.9.12-universal-apple-darwin.zip -o /tmp/c2patool.zip
+unzip /tmp/c2patool.zip -d /tmp/c2patool_bin/
+cp /tmp/c2patool_bin/c2patool/c2patool /opt/homebrew/bin/c2patool
+chmod +x /opt/homebrew/bin/c2patool
+```
 
 Core scripts need **Python 3.10+** stdlib only. Layer B model calls are optional.
 
@@ -154,6 +166,9 @@ The same machinery runs as a stdlib HTTP service (`service/scripts/server.py`) �
 | GET | `/openapi.json` | — | dynamically generated OpenAPI 3.0.3 spec |
 | POST | `/inspect` | `{"file": "<base64>", "name": "notes.md"}` | `{"ok", "kind", "suspicious", "report"}` |
 | POST | `/clean` | `{"file": "<base64>", "name": "notes.md", "options": {...}}` | `{"ok", "kind", "cleaned": "<base64>", "report"}` |
+| POST | `/rewrite` | `{"file": "<base64>", "name": "notes.md", "strength": "structural"}` | `{"ok", "rewritten", "cleaned": "<base64>", "report"}` |
+
+`/rewrite` always runs Layer B regardless of Layer A findings — required for disrupting Claude's SynthID-Text statistical watermark, which is undetectable locally. For PDFs, it extracts text via `pdftotext` and returns the rewritten content as plain text. Default strength: `structural` (full regeneration — all words replaced via a non-origin model).
 
 ```bash
 WM="http://127.0.0.1:8765"
@@ -550,8 +565,9 @@ Details: [`skills/remove-ai-marks/references/vendor-notes.md`](skills/remove-ai-
 Modern LLM watermarks often hide a signal in **which tokens are chosen** (generative / sampling bias), not only in invisible characters. Edit-based schemes inject Unicode or synonym rules. File schemes attach **C2PA** or generator metadata.
 
 - **Layer A** removes edit-based Unicode carriers (testable).
-- **Layer B** attacks sampling watermarks via heavy rewrite (best-effort; literature-standard attacks such as paraphrase / back-translation).
+- **Layer B** attacks sampling watermarks via heavy rewrite (best-effort; literature-standard attacks such as paraphrase / back-translation). **Layer B now always runs at `structural` strength** — it does not require Layer A to find anything, because Claude's SynthID-Text watermark leaves zero detectable signal locally yet is disrupted by full regeneration. Default model: `meta-llama/llama-3.3-70b-instruct` via OpenRouter.
 - **File cleaners** strip C2PA/XMP/props from supported containers.
+- **PDF text scan** (when `pdftotext` is installed): extracts PDF text and runs Layer A Unicode inspection + stylometry — the only way to surface invisible marks or AI cadence signals inside a PDF body.
 
 Until vendors ship public detectors and keys, **no tool can honestly certify** “this fails the official check.” Reports must separate verifiable vs best-effort work.
 
@@ -677,6 +693,33 @@ make smoke                          # quick CLI smoke on fixtures
 ```
 
 ## Changelog
+
+### [Unreleased] — detection engine improvements, always-rewrite policy, PDF text scan
+
+**Detection engine**
+
+- **PDF text extraction**: `inspect_pdf()` now calls `pdftotext` (poppler) to extract page text and runs Layer A Unicode inspection + stylometry on it — the only path for detecting invisible Unicode marks or AI cadence patterns inside a Claude-generated PDF body. `ContainerInspectReport` gains a `stylometry` field populated for PDFs when `pdftotext` is available. Inspect notes now report whether `pdftotext` was found and prompt installation when absent (`brew install poppler`)
+- **`/inspect` suspicious flag** now includes PDF stylometry score (≥ 0.65 → suspicious) in addition to Unicode hits and file metadata
+
+**Layer B — always-rewrite policy**
+
+- **Layer B now always runs** on all text and PDF files regardless of Layer A findings. Previously, `/rewrite` returned early with `rewritten: false` when Layer A found no Unicode marks. This was wrong: Claude's SynthID-Text leaves zero local signal but is disrupted by full regeneration. The early-exit is removed
+- **Default strength changed** from `paraphrase` → `structural`. Anthropic's own documentation confirms light editing does not remove SynthID-Text; full word replacement does
+- **Structural prompt updated** to preserve original format: paragraphs → paragraphs, bullets → bullets, section headings preserved. The intermediate outline is computed internally and never exposed in the output
+
+**PDF `/rewrite` support**
+
+- `/rewrite` now accepts PDF files: detects `%PDF` magic bytes or `.pdf` extension, extracts text via `pdftotext`, runs the full Layer A + Layer B pipeline on the text, and returns cleaned plain text. Error message guides installation of poppler when `pdftotext` is absent
+
+**Model upgrade**
+
+- Default Layer B model upgraded from `meta-llama/llama-3.1-8b-instruct` → `meta-llama/llama-3.3-70b-instruct` (8B → 70B parameters; Llama 3.3 generation; significantly better format preservation and content quality)
+
+**macOS tool installation**
+
+- Service startup documented with `PATH="/opt/homebrew/bin:$PATH"` to ensure homebrew-installed tools (`exiftool`, `qpdf`, `c2patool`, `pdftotext`) are discovered by the service process. macOS brew install commands added to README for all four tools including manual `c2patool` install (not in brew tap)
+
+---
 
 ### [v0.5.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.5.0) — service & Docker distribution, HTTP API, and verification harnesses
 

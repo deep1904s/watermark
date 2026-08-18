@@ -103,9 +103,11 @@ class ContainerInspectReport:
     # clean then went on to remove them.
     layer_a_total: int = 0
     layer_a_hits: list[dict] = field(default_factory=list)
+    # Stylometry report for PDFs whose text was extracted via pdftotext.
+    stylometry: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "path": self.path,
             "format": self.format,
             "has_c2pa": self.has_c2pa,
@@ -120,6 +122,9 @@ class ContainerInspectReport:
             "suspicious_total": self.layer_a_total,
             "layer_a_hits": self.layer_a_hits,
         }
+        if self.stylometry:
+            d["stylometry"] = self.stylometry
+        return d
 
 
 def detect_container_format(path: Path, data: bytes | None = None) -> str:
@@ -1408,6 +1413,30 @@ def _pdf_structured_blob(data: bytes) -> bytes:
     return no_streams + b"\n" + xmp
 
 
+def _extract_pdf_text(path: Path) -> str:
+    """Extract plain text from a PDF using pdftotext (poppler).
+
+    Returns empty string when pdftotext is not installed — callers must
+    check and surface a note rather than silently skipping the scan.
+    """
+    pdftotext = which("pdftotext")
+    if not pdftotext:
+        return ""
+    try:
+        r = subprocess.run(
+            [pdftotext, safe_arg(str(path)), "-"],
+            capture_output=True,
+            timeout=60,
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+        )
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return ""
+
+
 def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
     findings: list[str] = []
     has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
@@ -1428,7 +1457,43 @@ def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
     if ct.get("has_manifest"):
         has_c2pa = True
         findings.append("c2patool reports C2PA-related manifest")
-    return has_c2pa, has_ai or has_c2pa, findings, {"tools": tools}
+
+    # Text-level scan: extract PDF content and run Layer A + stylometry.
+    # This is the primary path for detecting statistical/invisible watermarks
+    # in AI-generated PDFs (e.g. Claude outputs) that carry no file metadata.
+    from text_unicode import inspect_text  # local import to avoid cycles
+    from score_stylometry import score_text_stylometry  # local import
+
+    pdftotext_available = bool(which("pdftotext"))
+    text_inspect: dict = {}
+    stylometry: dict = {}
+    extracted_text = _extract_pdf_text(path)
+    if extracted_text.strip():
+        ta = inspect_text(extracted_text).to_dict()
+        text_inspect = ta
+        if ta["suspicious_total"]:
+            has_ai = True
+            for h in ta["hits"]:
+                findings.append(
+                    f"layer-a text: {h['codepoint']} {h['label']} x{h['count']} ({h['kind']})"
+                )
+        s_rep = score_text_stylometry(extracted_text, path=str(path))
+        stylometry = s_rep.to_dict()
+        if stylometry.get("score", 0.0) >= 0.65:
+            has_ai = True
+            findings.append(
+                f"stylometry score={stylometry['score']:.3f} ({stylometry['confidence_level']})"
+            )
+        elif stylometry.get("findings"):
+            for f in stylometry["findings"]:
+                findings.append(f"stylometry (informational): {f}")
+
+    return has_c2pa, has_ai or has_c2pa, findings, {
+        "tools": tools,
+        "text_inspect": text_inspect,
+        "stylometry": stylometry,
+        "pdftotext_available": pdftotext_available,
+    }
 
 
 def _pdf_structural_rewrite(dest: Path, actions: list[str]) -> bool:
@@ -1551,6 +1616,12 @@ def inspect_container(path: Path) -> ContainerInspectReport:
     elif fmt == "pdf":
         has_c2pa, has_ai, findings, details = inspect_pdf(path, data)
         tools = details.pop("tools", {})
+        # Pull text-level Layer A hits and stylometry into the report fields
+        # so the HTTP server's `suspicious` flag and callers see them uniformly.
+        _ti = details.pop("text_inspect", {})
+        if _ti.get("suspicious_total"):
+            layer_a_total = _ti["suspicious_total"]
+            layer_a_hits = _ti.get("hits", [])
     elif fmt == "docx":
         has_c2pa, has_ai, findings, details = inspect_docx(data)
     elif fmt == "xlsx":
@@ -1609,10 +1680,23 @@ def inspect_container(path: Path) -> ContainerInspectReport:
             pass
 
     notes: list[str] = []
+    pdf_stylometry: dict = {}
     if fmt == "pdf":
-        notes.append(
-            "PDF inspection is best-effort; exiftool/c2patool give more reliable metadata detection"
-        )
+        pdftotext_ok = details.pop("pdftotext_available", False)
+        pdf_stylometry = details.pop("stylometry", {})
+        if pdftotext_ok:
+            notes.append(
+                "PDF text extracted via pdftotext; Layer A Unicode + stylometry applied to content"
+            )
+            notes.append(
+                "PDF metadata: exiftool/c2patool give more reliable C2PA/EXIF/XMP detection"
+            )
+        else:
+            notes.append(
+                "PDF inspection is best-effort; install poppler (pdftotext) for text-level "
+                "watermark detection, and exiftool/c2patool for metadata detection — "
+                "run: brew install poppler exiftool c2patool"
+            )
     elif fmt in ("docx", "xlsx", "pptx"):
         notes.append(f"{fmt.upper()}: metadata/provenance and embedded media are scanned")
     elif fmt == "epub":
@@ -1641,6 +1725,7 @@ def inspect_container(path: Path) -> ContainerInspectReport:
         notes=notes,
         layer_a_total=layer_a_total,
         layer_a_hits=layer_a_hits,
+        stylometry=pdf_stylometry,
     )
 
 

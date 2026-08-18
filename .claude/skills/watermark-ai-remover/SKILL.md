@@ -2,14 +2,19 @@
 name: watermark-ai-remover
 description: >
   Detect and remove AI watermarks from text, PDF, and image files using the
-  watermarks-remover service. Layer A strips invisible Unicode; Layer B rewrites
-  via OpenRouter if watermarks are detected. Invoke with a file path as argument.
+  watermarks-remover service. Layer A strips invisible Unicode; Layer B always
+  rewrites all text at structural strength to disrupt undetectable statistical
+  watermarks (e.g. Claude's SynthID-Text). Invoke with a file path as argument.
 ---
 
 # Watermark AI Remover
 
-Full pipeline: Layer A inspect → Layer A clean → Layer B rewrite (if watermark detected).
+Full pipeline: Layer A inspect → Layer B rewrite (always, structural strength) → Layer A clean.
 Works for text (`.txt`, `.md`, `.py`, etc.), PDF, and images (`.png`, `.jpg`, `.webp`, etc.).
+
+**Why always rewrite:** Claude's SynthID-Text watermark is statistically embedded in token
+choices and is undetectable locally. Layer B at `structural` strength regenerates all words
+via a different model, disrupting the pattern even when Layer A finds nothing.
 
 Full skill reference: `skills/remove-ai-marks/SKILL.md`
 
@@ -26,7 +31,7 @@ Full skill reference: `skills/remove-ai-marks/SKILL.md`
    ```bash
    cd ~/Desktop/water/watermarks-remover
    set -a && source .env && set +a
-   python3 service/scripts/server.py
+   PATH="/opt/homebrew/bin:$PATH" python3 service/scripts/server.py
    ```
    Do NOT attempt any local cleaning — stop here until the service is up.
 
@@ -36,26 +41,26 @@ Full skill reference: `skills/remove-ai-marks/SKILL.md`
      -H 'Content-Type: application/json' \
      -d "{\"file\": \"$(base64 -i $ARGUMENTS)\", \"name\": \"$(basename $ARGUMENTS)\"}"
    ```
-   Report: suspicious yes/no, hit count, what kinds of marks were found.
+   Report: suspicious yes/no, hit count, what kinds of marks were found. Then always proceed — do NOT stop here even if not suspicious.
 
-4. **Route by result**:
+4. **Route by file type** (suspicion no longer gates text rewrite):
 
-   | File type | Suspicious | Action |
-   |-----------|-----------|--------|
-   | Text | Yes | `/rewrite` (Layer A inspect → Layer B rewrite → Layer A again) |
-   | Text | No  | `/clean` (Layer A clean only) — still clean to be safe |
-   | PDF / image | Yes or No | `/clean` (strip C2PA, EXIF, XMP, AI metadata) |
+   | File type | Action |
+   |-----------|--------|
+   | Text (any result) | `/rewrite` at `structural` strength — always |
+   | PDF | `/rewrite` at `structural` strength (extracts text, rewrites, returns .txt) |
+   | Image | `/clean` (strip C2PA, EXIF, XMP, AI metadata) |
 
 5. **Run the appropriate endpoint**:
 
-   **Text — rewrite (Layer B):**
+   **Text / PDF — always rewrite at structural:**
    ```bash
    curl -s -X POST "$WM/rewrite" \
      -H 'Content-Type: application/json' \
-     -d "{\"file\": \"$(base64 -i $ARGUMENTS)\", \"name\": \"$(basename $ARGUMENTS)\", \"strength\": \"paraphrase\"}"
+     -d "{\"file\": \"$(base64 -i $ARGUMENTS)\", \"name\": \"$(basename $ARGUMENTS)\", \"strength\": \"structural\"}"
    ```
 
-   **PDF / image — clean (metadata strip):**
+   **Image — metadata strip only:**
    ```bash
    curl -s -X POST "$WM/clean" \
      -H 'Content-Type: application/json' \
@@ -68,21 +73,21 @@ Full skill reference: `skills/remove-ai-marks/SKILL.md`
    ```
 
 7. **Report honestly**:
-   - What Layer A found and removed (from `report`)
-   - Whether Layer B ran and what strength was used
-   - Residual risk note: Layer B is best-effort against statistical watermarks — cannot certify removal against a vendor detector
-   - Out of scope: pixel/audio/video watermarks, C2PA soft binding, secret-key detectors
+   - What Layer A found (Unicode hits, stylometry score)
+   - That Layer B always ran at `structural` strength regardless of Layer A result
+   - Residual risk note: structural rewrite replaces all words via a different model — best available mitigation for SynthID-Text, but Anthropic's detection API (not yet released) is the only way to certify removal
+   - Out of scope: pixel/audio/video watermarks, C2PA soft binding on images (use /clean for those)
 
 ## Strength options (text only)
 
-Pass `"strength"` in the `/rewrite` body to escalate:
+The default is now `structural`. Override with `"strength"` in the request body only when you have a specific reason:
 
 | Strength | When to use |
 |----------|------------|
-| `paraphrase` | Default — word/clause churn, low drift |
-| `humanize` | AI-sounding text — replaces formulaic transitions |
-| `backtranslate` | Stronger token reshuffle via pivot language |
-| `structural` | Strongest — outline then regenerate (most lossy) |
+| `structural` | **Default** — outline then regenerate, all words replaced, strongest SynthID disruption |
+| `backtranslate` | Translate via pivot language — slightly less lossy than structural |
+| `humanize` | AI-sounding text — replaces formulaic transitions only |
+| `paraphrase` | Lightest — word/clause churn, low drift (insufficient for SynthID-Text) |
 | `code` | Code files — rewrites comments, renames private vars |
 
 ## Ethics

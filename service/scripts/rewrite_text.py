@@ -77,8 +77,10 @@ PROMPTS = {
     ),
     "structural_write": (
         "Write a complete document from this outline in natural, varied human prose. "
-        "Avoid formulaic transitions. Do not omit any bullet. Output only the document."
-        "\n\n---\n{TEXT}"
+        "Avoid formulaic transitions. Do not omit any bullet. "
+        "Match the original format exactly: if the original used paragraphs, use paragraphs; "
+        "if it used bullet points, use bullet points; preserve section headings if any. "
+        "Output only the final document — no outline, no preamble.\n\n---\n{TEXT}"
     ),
 }
 
@@ -286,9 +288,14 @@ def build_prompt(strength: str, text: str, *, lang: str, original_lang: str) -> 
         )
     if strength == "structural":
         return (
-            "First extract a bullet outline of all claims (no full sentences). "
-            "Then write a complete document from that outline in natural, varied human "
-            "prose without omitting any bullet. Output only the final document.\n\n---\n"
+            "First, internally extract a bullet outline of all claims (do not output the outline). "
+            "Then write a complete document from that outline in natural, varied human prose "
+            "without omitting any claim. "
+            "Match the original format exactly: if the original used paragraphs output paragraphs; "
+            "if it used bullet points output bullet points; preserve any section headings. "
+            "Match the approximate length of the original. "
+            "Output only the final rewritten document — no outline, no preamble, no commentary."
+            "\n\n---\n"
             f"{text}"
         )
     raise ValueError(f"unknown strength: {strength}")

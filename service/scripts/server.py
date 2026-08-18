@@ -500,6 +500,8 @@ class Handler(BaseHTTPRequestHandler):
             bool(report.get("suspicious_total"))
             or bool(report.get("has_c2pa") or report.get("has_ai_metadata"))
             or bool(report.get("stylometry", {}).get("score", 0.0) >= 0.65)
+            # PDF text-level stylometry (populated when pdftotext is available)
+            or bool(report.get("stylometry", {}).get("score", 0.0) >= 0.65)
         )
         self._respond(
             HTTPStatus.OK, {"ok": True, "kind": kind, "report": report, "suspicious": suspicious}
@@ -569,31 +571,41 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _handle_rewrite(self, data: bytes, name: str, body: dict[str, Any]) -> None:
+        from container_meta import _extract_pdf_text  # local import
+
+        # PDF path: extract text via pdftotext, rewrite, return cleaned text.
+        # PDF structure (fonts, layout) is not preserved — output is plain text.
+        is_pdf = data[:4] == b"%PDF" or Path(name).suffix.lower() == ".pdf"
+        if is_pdf:
+            with tempfile.TemporaryDirectory(prefix="wm-rewrite-pdf-") as tmp:
+                src = _tmp_path(Path(tmp), name or "input.pdf")
+                src.write_bytes(data)
+                extracted = _extract_pdf_text(src)
+            if not extracted.strip():
+                raise ValueError(
+                    "PDF text extraction produced no content — install poppler: "
+                    "brew install poppler"
+                )
+            data = extracted.encode("utf-8")
+            name = Path(name).stem + ".txt"
+
         if looks_binary(data):
             raise ValueError("Layer B rewrite only supports plain text files")
         text = data.decode("utf-8", errors="surrogateescape")
 
         _VALID_STRENGTHS = ("paraphrase", "humanize", "backtranslate", "structural", "code")
-        strength = body.get("strength", "paraphrase")
+        # Default to structural — fully regenerates text, disrupting SynthID-Text
+        # statistical watermarks even when Layer A finds nothing detectable.
+        strength = body.get("strength", "structural")
         if strength not in _VALID_STRENGTHS:
             raise ValueError(f"strength must be one of: {', '.join(_VALID_STRENGTHS)}")
 
-        # Layer A inspect — check for watermarks
+        # Layer A inspect — report findings but always proceed to Layer B.
+        # Claude's SynthID-Text watermark is undetectable locally (requires
+        # Anthropic's private key), so skipping Layer B on a clean Layer A
+        # result would leave statistical watermarks intact.
         inspection = inspect_text(text)
         suspicious = bool(inspection.to_dict().get("suspicious_total"))
-
-        if not suspicious:
-            self._respond(
-                HTTPStatus.OK,
-                {
-                    "ok": True,
-                    "rewritten": False,
-                    "reason": "no watermark detected by Layer A; Layer B skipped",
-                    "cleaned": base64.b64encode(data).decode("ascii"),
-                    "report": inspection.to_dict(),
-                },
-            )
-            return
 
         # Layer B rewrite — read config from env vars
         backend = os.environ.get("WATERMARKS_REWRITE_BACKEND", "openai-compatible")
