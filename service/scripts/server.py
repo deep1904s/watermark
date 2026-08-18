@@ -11,6 +11,10 @@ Endpoints:
     POST /inspect        -> {"file": <base64>, "name": "x.png"} -> findings JSON
     POST /clean          -> {"file": <base64>, "name": "x.png", "options": {...}}
                          -> {"cleaned": <base64>, "report": {...}}
+    POST /rewrite        -> {"file": <base64>, "name": "x.txt"}
+                         -> inspects (Layer A); if watermark detected runs Layer B
+                            rewrite via WATERMARKS_REWRITE_* env vars; returns
+                            {"rewritten": bool, "cleaned": <base64>, "report": {...}}
 
 Hardening mirrors the CLIs: input size caps, binary-as-text guard, atomic
 writes, loopback-only bind by default, optional bearer API key. Run it as an
@@ -45,6 +49,7 @@ from container_meta import clean_container, inspect_container
 from format_dispatch import classify_bytes
 from image_meta import clean_image, inspect_image
 from score_stylometry import score_text_stylometry
+from rewrite_text import rewrite as _layer_b_rewrite
 from text_unicode import clean_text, inspect_text
 
 VERSION = os.environ.get("WATERMARKS_SERVER_VERSION", "dev")
@@ -239,6 +244,49 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
             },
         }
     },
+    "/rewrite": {
+        "post": {
+            "summary": (
+                "Inspect text (Layer A); if watermark detected, rewrite via Layer B "
+                "(WATERMARKS_REWRITE_* env vars). Text only."
+            ),
+            "requestBody": _schema(
+                required=True,
+                content={
+                    "application/json": _schema(
+                        schema=_file_request(
+                            {
+                                "properties": {
+                                    "strength": _schema(
+                                        type="string",
+                                        enum=["paraphrase", "humanize", "backtranslate", "structural", "code"],
+                                        description="Rewrite strength (default: paraphrase)",
+                                    )
+                                }
+                            }
+                        )
+                    )
+                },
+            ),
+            "responses": {
+                "200": _schema(
+                    type="object",
+                    properties={
+                        "ok": _schema(type="boolean"),
+                        "rewritten": _schema(
+                            type="boolean",
+                            description="true if Layer B ran; false if no watermark was detected",
+                        ),
+                        "cleaned": _schema(
+                            type="string",
+                            description="Base64-encoded result (rewritten or original)",
+                        ),
+                        "report": _schema(type="object"),
+                    },
+                )
+            },
+        }
+    },
 }
 
 _ERROR_SCHEMA = _schema(
@@ -398,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._respond(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
             return
-        if path not in ("/inspect", "/clean"):
+        if path not in ("/inspect", "/clean", "/rewrite"):
             self._respond(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
             return
         body = self._read_json()
@@ -418,6 +466,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/inspect":
                 self._handle_inspect(data, name)
+            elif path == "/rewrite":
+                self._handle_rewrite(data, name, body)
             else:
                 self._handle_clean(data, name, body)
         except ValueError as e:
@@ -515,6 +565,78 @@ class Handler(BaseHTTPRequestHandler):
                 "kind": kind,
                 "cleaned": base64.b64encode(cleaned_bytes).decode("ascii"),
                 "report": report,
+            },
+        )
+
+    def _handle_rewrite(self, data: bytes, name: str, body: dict[str, Any]) -> None:
+        if looks_binary(data):
+            raise ValueError("Layer B rewrite only supports plain text files")
+        text = data.decode("utf-8", errors="surrogateescape")
+
+        _VALID_STRENGTHS = ("paraphrase", "humanize", "backtranslate", "structural", "code")
+        strength = body.get("strength", "paraphrase")
+        if strength not in _VALID_STRENGTHS:
+            raise ValueError(f"strength must be one of: {', '.join(_VALID_STRENGTHS)}")
+
+        # Layer A inspect — check for watermarks
+        inspection = inspect_text(text)
+        suspicious = bool(inspection.to_dict().get("suspicious_total"))
+
+        if not suspicious:
+            self._respond(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "rewritten": False,
+                    "reason": "no watermark detected by Layer A; Layer B skipped",
+                    "cleaned": base64.b64encode(data).decode("ascii"),
+                    "report": inspection.to_dict(),
+                },
+            )
+            return
+
+        # Layer B rewrite — read config from env vars
+        backend = os.environ.get("WATERMARKS_REWRITE_BACKEND", "openai-compatible")
+        model = os.environ.get("WATERMARKS_REWRITE_MODEL") or None
+        base_url = os.environ.get("WATERMARKS_REWRITE_BASE_URL", "http://127.0.0.1:11434")
+        api_key = os.environ.get("WATERMARKS_REWRITE_API_KEY") or None
+        allow_remote = os.environ.get("WATERMARKS_REWRITE_ALLOW_REMOTE", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        reasoning_effort = os.environ.get("WATERMARKS_REWRITE_REASONING_EFFORT", "none") or None
+
+        if not model:
+            raise ValueError(
+                "Layer B not configured: set WATERMARKS_REWRITE_MODEL in the environment"
+            )
+
+        try:
+            rewritten_text, info = _layer_b_rewrite(
+                text,
+                backend=backend,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                strength=strength,
+                lang="French",
+                original_lang="English",
+                timeout=120.0,
+                layer_a_after=True,
+                temperature=0.9,
+                candidates=1,
+                allow_remote=allow_remote,
+                reasoning_effort=reasoning_effort if reasoning_effort != "off" else None,
+            )
+        except (SystemExit, RuntimeError) as e:
+            raise ValueError(f"Layer B rewrite failed: {e}") from e
+
+        self._respond(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "rewritten": True,
+                "cleaned": base64.b64encode(rewritten_text.encode("utf-8")).decode("ascii"),
+                "report": {"layer_a_inspect": inspection.to_dict(), "layer_b": info},
             },
         )
 
